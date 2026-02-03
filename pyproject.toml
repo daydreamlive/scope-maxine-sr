@@ -1,0 +1,44 @@
+[project]
+name = "scope-maxine-sr"
+version = "0.1.0"
+description = "NVIDIA Maxine Super Resolution plugin for Daydream Scope"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Daydream" }]
+keywords = ["daydream-scope", "plugin", "nvidia", "maxine", "super-resolution", "upscaling"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    "torch",
+    "numpy",
+]
+
+[project.optional-dependencies]
+# daydream-scope is a peer dependency - must be installed separately
+# Users install via: pip install daydream-scope daydream-scope-maxine-sr
+
+[project.entry-points."scope"]
+maxine_sr = "scope_maxine_sr"
+
+[project.urls]
+Homepage = "https://github.com/daydreamlive/scope"
+Repository = "https://github.com/daydreamlive/scope"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/scope_maxine_sr"]
+
+[dependency-groups]
+dev = [
+    "pytest>=7.0.0",
+]
