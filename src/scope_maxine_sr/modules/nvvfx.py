@@ -411,10 +411,12 @@ class MaxineSuperResolution:
         self._effect = NvVFX_Handle()
         self._input_image = NvCVImage()
         self._output_image = NvCVImage()
-        self._staging_image = NvCVImage()  # For CPU<->GPU transfers
         self._initialized = False
         self._current_input_size = None
         self._current_output_size = None
+        # PyTorch tensors to hold GPU memory (ensures same CUDA context)
+        self._input_buffer = None
+        self._output_buffer = None
 
         # Load library
         _lib.load()
@@ -448,48 +450,52 @@ class MaxineSuperResolution:
         )
 
     def _allocate_images(self, input_h: int, input_w: int):
-        """Allocate GPU images for input and output."""
+        """Allocate GPU images for input and output.
+
+        Uses PyTorch tensors for GPU memory allocation to ensure the memory
+        is in the same CUDA context as the upstream pipeline.
+        """
         output_h = int(input_h * self.scale)
         output_w = int(input_w * self.scale)
 
-        # Allocate input image on GPU (BGR, F32, planar as required by SuperRes)
-        status = _lib.nvcvimage.NvCVImage_Alloc(
+        # Allocate GPU memory using PyTorch (ensures same CUDA context)
+        # Shape is (3, H, W) for planar BGR F32
+        self._input_buffer = torch.zeros(
+            (3, input_h, input_w), dtype=torch.float32, device=self.device
+        )
+        self._output_buffer = torch.zeros(
+            (3, output_h, output_w), dtype=torch.float32, device=self.device
+        )
+
+        # Wrap PyTorch GPU memory with NvCVImage using Init
+        # For planar format, pitch is width * sizeof(float) for one plane
+        input_pitch = input_w * 4
+        status = _lib.nvcvimage.NvCVImage_Init(
             byref(self._input_image),
             c_uint(input_w),
             c_uint(input_h),
+            c_int(input_pitch),
+            c_void_p(self._input_buffer.data_ptr()),
             c_uint8(NVCV_BGR),
             c_uint8(NVCV_F32),
             c_uint8(NVCV_PLANAR),
             c_uint8(NVCV_GPU),
-            c_uint(0),  # Default alignment
         )
-        _check_status(status, "Alloc input image")
+        _check_status(status, "Init input image")
 
-        # Allocate output image on GPU
-        status = _lib.nvcvimage.NvCVImage_Alloc(
+        output_pitch = output_w * 4
+        status = _lib.nvcvimage.NvCVImage_Init(
             byref(self._output_image),
             c_uint(output_w),
             c_uint(output_h),
+            c_int(output_pitch),
+            c_void_p(self._output_buffer.data_ptr()),
             c_uint8(NVCV_BGR),
             c_uint8(NVCV_F32),
             c_uint8(NVCV_PLANAR),
             c_uint8(NVCV_GPU),
-            c_uint(0),
         )
-        _check_status(status, "Alloc output image")
-
-        # Allocate staging image on CPU for transfers
-        status = _lib.nvcvimage.NvCVImage_Alloc(
-            byref(self._staging_image),
-            c_uint(max(input_w, output_w)),
-            c_uint(max(input_h, output_h)),
-            c_uint8(NVCV_BGR),
-            c_uint8(NVCV_F32),
-            c_uint8(NVCV_PLANAR),
-            c_uint8(NVCV_CPU),
-            c_uint(0),
-        )
-        _check_status(status, "Alloc staging image")
+        _check_status(status, "Init output image")
 
         self._current_input_size = (input_h, input_w)
         self._current_output_size = (output_h, output_w)
@@ -498,6 +504,15 @@ class MaxineSuperResolution:
 
     def _load_effect(self):
         """Load the effect (must be called after setting images)."""
+        # Set CUDA stream from PyTorch to ensure context compatibility
+        # This is critical when used as postprocessor after CUDA-heavy pipelines
+        cuda_stream = torch.cuda.current_stream(self.device)
+        stream_ptr = cuda_stream.cuda_stream  # Raw CUDA stream pointer
+        status = _lib.nvvfx.NvVFX_SetCudaStream(
+            self._effect, NVVFX_CUDA_STREAM, CUstream(stream_ptr)
+        )
+        _check_status(status, "SetCudaStream")
+
         # Set input/output images
         status = _lib.nvvfx.NvVFX_SetImage(self._effect, NVVFX_INPUT_IMAGE, byref(self._input_image))
         _check_status(status, "SetImage(INPUT)")
@@ -519,6 +534,11 @@ class MaxineSuperResolution:
             input_h: Input height in pixels
             input_w: Input width in pixels
         """
+        # Synchronize CUDA to ensure clean state before initializing Maxine SDK.
+        # This is critical when used as a postprocessor after CUDA-heavy pipelines
+        # like diffusion models, to avoid CUDA context conflicts.
+        torch.cuda.synchronize()
+
         # Check minimum resolution requirements
         if input_h < 288 or input_w < 512:
             raise ValueError(
@@ -553,6 +573,11 @@ class MaxineSuperResolution:
         if c != 3:
             raise ValueError(f"Expected 3 channels (RGB), got {c}")
 
+        # Synchronize CUDA to ensure any pending operations from upstream
+        # pipelines (e.g., diffusion models) are complete before Maxine
+        # uses its own CUDA context
+        torch.cuda.synchronize()
+
         # Initialize on first frame or if resolution changed
         if not self._initialized or self._current_input_size != (h, w):
             if self._initialized:
@@ -583,87 +608,37 @@ class MaxineSuperResolution:
         return output_tensor.to(self.device)
 
     def _copy_to_input(self, data: np.ndarray):
-        """Copy numpy array to GPU input image via staging buffer."""
-        # Create a temporary CPU NvCVImage wrapping the numpy data
-        h, w = self._current_input_size
-        temp_cpu = NvCVImage()
-
+        """Copy numpy array to GPU input buffer (PyTorch tensor)."""
         # data is in CHW planar format (3, H, W)
-        data_contiguous = np.ascontiguousarray(data, dtype=np.float32)
-        pitch = w * 4  # bytes per row for F32
-
-        status = _lib.nvcvimage.NvCVImage_Init(
-            byref(temp_cpu),
-            c_uint(w),
-            c_uint(h),
-            c_int(pitch),
-            data_contiguous.ctypes.data_as(c_void_p),
-            c_uint8(NVCV_BGR),
-            c_uint8(NVCV_F32),
-            c_uint8(NVCV_PLANAR),
-            c_uint8(NVCV_CPU),
-        )
-        _check_status(status, "Init temp CPU image")
-
-        # Transfer CPU -> GPU
-        status = _lib.nvcvimage.NvCVImage_Transfer(
-            byref(temp_cpu),
-            byref(self._input_image),
-            c_float(1.0),
-            CUstream(0),  # Default stream
-            byref(self._staging_image),
-        )
-        _check_status(status, "Transfer CPU->GPU")
+        # Copy directly to PyTorch tensor backing the NvCVImage
+        data_tensor = torch.from_numpy(data).to(self.device)
+        self._input_buffer.copy_(data_tensor)
 
     def _copy_from_output(self) -> np.ndarray:
-        """Copy GPU output image to numpy array via staging buffer."""
-        output_h, output_w = self._current_output_size
-
-        # Allocate output numpy array
-        output_data = np.zeros((3, output_h, output_w), dtype=np.float32)
-        pitch = output_w * 4
-
-        # Create temporary CPU NvCVImage
-        temp_cpu = NvCVImage()
-        status = _lib.nvcvimage.NvCVImage_Init(
-            byref(temp_cpu),
-            c_uint(output_w),
-            c_uint(output_h),
-            c_int(pitch),
-            output_data.ctypes.data_as(c_void_p),
-            c_uint8(NVCV_BGR),
-            c_uint8(NVCV_F32),
-            c_uint8(NVCV_PLANAR),
-            c_uint8(NVCV_CPU),
-        )
-        _check_status(status, "Init output CPU image")
-
-        # Transfer GPU -> CPU
-        status = _lib.nvcvimage.NvCVImage_Transfer(
-            byref(self._output_image),
-            byref(temp_cpu),
-            c_float(1.0),
-            CUstream(0),
-            byref(self._staging_image),
-        )
-        _check_status(status, "Transfer GPU->CPU")
-
-        return output_data
+        """Copy GPU output buffer (PyTorch tensor) to numpy array."""
+        # Copy directly from PyTorch tensor
+        return self._output_buffer.cpu().numpy()
 
     def cleanup(self):
         """Release all resources."""
+        # Synchronize CUDA before cleanup to ensure no pending operations
+        # are using the buffers we're about to deallocate
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
         if self._effect:
             _lib.nvvfx.NvVFX_DestroyEffect(self._effect)
-            self._effect = NvVFX_Handle()
 
-        if self._input_image.pixels:
-            _lib.nvcvimage.NvCVImage_Dealloc(byref(self._input_image))
+        # Reset all structures to fresh state
+        # Input/output images are backed by PyTorch tensors (NvCVImage_Init),
+        # so we don't call Dealloc - just release the PyTorch buffers
+        self._effect = NvVFX_Handle()
+        self._input_image = NvCVImage()
+        self._output_image = NvCVImage()
 
-        if self._output_image.pixels:
-            _lib.nvcvimage.NvCVImage_Dealloc(byref(self._output_image))
-
-        if self._staging_image.pixels:
-            _lib.nvcvimage.NvCVImage_Dealloc(byref(self._staging_image))
+        # Release PyTorch GPU buffers
+        self._input_buffer = None
+        self._output_buffer = None
 
         self._initialized = False
         self._current_input_size = None
