@@ -25,7 +25,7 @@ dependencies = [
 # Users install via: pip install daydream-scope daydream-scope-maxine-sr
 
 [project.entry-points."scope"]
-maxine_sr = "scope_maxine_sr"
+maxine_sr = "scope_maxine_sr:plugin"
 
 [project.urls]
 Homepage = "https://github.com/daydreamlive/scope"
