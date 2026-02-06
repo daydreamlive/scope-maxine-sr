@@ -8,6 +8,7 @@ from scope.core.pipelines.base_schema import (
     BasePipelineConfig,
     ModeDefaults,
     UsageType,
+    ui_field_config,
 )
 
 
@@ -50,6 +51,9 @@ class MaxineSRConfig(BasePipelineConfig):
             "Upscaling factor. Supported: 1.33x (4/3), 1.5x, 2x, 3x, 4x. "
             "Note: 4x is limited to inputs up to 540p."
         ),
+        json_schema_extra=ui_field_config(
+            order=1, label="Scale Factor", is_load_param=True
+        ),
     )
 
     mode: Literal[0, 1] = Field(
@@ -58,5 +62,8 @@ class MaxineSRConfig(BasePipelineConfig):
             "Super Resolution mode. "
             "0 = optimized for lossy/encoded content (recommended for most video). "
             "1 = optimized for lossless content."
+        ),
+        json_schema_extra=ui_field_config(
+            order=2, label="SR Mode", is_load_param=True
         ),
     )
