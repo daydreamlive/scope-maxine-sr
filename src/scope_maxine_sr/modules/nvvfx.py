@@ -25,7 +25,6 @@ from ctypes import (
 )
 from pathlib import Path
 
-import numpy as np
 import torch
 
 logger = logging.getLogger(__name__)
@@ -588,36 +587,21 @@ class MaxineSuperResolution:
         frame_bgr = frame[:, :, [2, 1, 0]]  # RGB -> BGR
         frame_planar = frame_bgr.permute(2, 0, 1).contiguous()  # HWC -> CHW (planar)
 
-        # Copy to GPU input buffer via staging
-        frame_np = frame_planar.cpu().numpy()
-        self._copy_to_input(frame_np)
+        # Copy directly to GPU input buffer (avoid CPU round-trip)
+        self._input_buffer.copy_(frame_planar)
 
         # Run the effect
         status = _lib.nvvfx.NvVFX_Run(self._effect, c_int(0))  # 0 = synchronous
         _check_status(status, "Run")
 
-        # Copy from GPU output buffer
-        output_np = self._copy_from_output()
-
-        # Convert back to HWC RGB tensor
-        output_h, output_w = self._current_output_size
-        output_tensor = torch.from_numpy(output_np).reshape(3, output_h, output_w)
+        # Read directly from GPU output buffer (avoid CPU round-trip)
+        output_tensor = self._output_buffer.clone()  # (3, H, W) planar BGR
         output_tensor = output_tensor.permute(1, 2, 0)  # CHW -> HWC
         output_tensor = output_tensor[:, :, [2, 1, 0]]  # BGR -> RGB
 
-        return output_tensor.to(self.device)
+        return output_tensor
 
-    def _copy_to_input(self, data: np.ndarray):
-        """Copy numpy array to GPU input buffer (PyTorch tensor)."""
-        # data is in CHW planar format (3, H, W)
-        # Copy directly to PyTorch tensor backing the NvCVImage
-        data_tensor = torch.from_numpy(data).to(self.device)
-        self._input_buffer.copy_(data_tensor)
 
-    def _copy_from_output(self) -> np.ndarray:
-        """Copy GPU output buffer (PyTorch tensor) to numpy array."""
-        # Copy directly from PyTorch tensor
-        return self._output_buffer.cpu().numpy()
 
     def cleanup(self):
         """Release all resources."""
