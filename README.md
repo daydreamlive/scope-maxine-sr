@@ -1,5 +1,7 @@
 # scope-maxine-sr
 
+[![Available on Daydream](https://img.shields.io/badge/Daydream-Install_Node-FF6B35)](https://app.daydream.live/nodes/daydreamlive/maxine-sr)
+
 NVIDIA Maxine Super Resolution plugin for Daydream Scope.
 
 AI-powered video upscaling using NVIDIA's Maxine Video Effects SDK.
